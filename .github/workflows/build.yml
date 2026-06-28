@@ -3,6 +3,12 @@ name: Build Kernel fogos RKSU+SUSFS
 on:
   workflow_dispatch:
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+  DEVICE: fogos
+  KERNEL_REPO: https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375
+  KERNEL_BRANCH: sixteen
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -15,36 +21,26 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update -qq
-          sudo apt install -y --no-install-recommends \
-            bc bison build-essential flex libssl-dev \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            ccache python3 zip unzip git wget curl
+          sudo apt install -y --no-install-recommends bc bison build-essential flex libssl-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi ccache python3 zip unzip git wget curl
 
       - name: Setup Clang
         run: |
-          git clone --depth=1 --branch lineage-20.0 \
-            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
-            $HOME/clang
+          git clone --depth=1 --branch lineage-20.0 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b $HOME/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
       - name: Clone Kernel Source
         run: |
-          git clone --depth=1 --branch sixteen \
-            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375 kernel
-          cd kernel
-          echo "Kernel commit: $(git rev-parse --short HEAD)"
+          git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} ${{ env.KERNEL_REPO }} kernel
+          cd kernel && echo "Kernel: $(git rev-parse --short HEAD)"
 
       - name: Fix Motorola sx937x Bug
         run: |
           cd kernel
-          if [ -f "drivers/misc/sx937x/sx937x_sar.c" ]; then
-            sed -i '1i #include <linux/i2c.h>' drivers/misc/sx937x/sx937x_sar.c
-          fi
+          sed -i '1i #include <linux/i2c.h>' drivers/misc/sx937x/sx937x_sar.c
 
       - name: Integrate RKSU + SUSFS (susfs-main)
         run: |
           cd kernel
-          # Gunakan setup.sh resmi dari rsuntk/KernelSU branch susfs-main
           curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/susfs-main/kernel/setup.sh" | bash -s susfs-main || {
             echo "setup.sh failed, falling back to manual integration"
             git clone --depth=1 --branch susfs-main https://github.com/rsuntk/KernelSU.git KernelSU
@@ -57,7 +53,7 @@ jobs:
             fi
           }
 
-      - name: Configure Kernel (Force Kprobes)
+      - name: Configure Kernel (Force Manual Hooks)
         run: |
           cd kernel
           export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
@@ -67,25 +63,19 @@ jobs:
           
           make O=out ARCH=arm64 vendor/holi-qgki_defconfig
           scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
-          
-          # PENTING: Paksa KPROBES dan MATIKAN MANUAL_HOOK agar tidak kena error Kbuild:142
-          cat >> out/.config << 'EOF'
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          CONFIG_KSU_MANUAL_HOOK=n
-          CONFIG_KSU_KPROBE_HOOKS=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=n
-          CONFIG_OVERLAY_FS=y
-          EOF
-          
+
+          scripts/config --file out/.config --enable KSU
+          scripts/config --file out/.config --enable KSU_MANUAL_HOOK
+          scripts/config --file out/.config --disable KPROBES
+          scripts/config --file out/.config --enable KPROBES
+          scripts/config --file out/.config --enable KSU_SUSFS
+          scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+          scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
+          scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file out/.config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file out/.config --disable KSU_SUSFS_ENABLE_LOG
+          scripts/config --file out/.config --enable OVERLAY_FS
+
           yes "" | make O=out olddefconfig
           yes "" | make O=out olddefconfig
 
@@ -98,7 +88,6 @@ jobs:
           export USE_CCACHE=1 CCACHE_DIR=$HOME/.ccache
           
           make -j$(nproc) O=out Image dtbs 2>&1 | tee build.log
-          
           if [ ! -f "out/arch/arm64/boot/Image" ]; then
             echo "Build failed!"
             tail -100 build.log
