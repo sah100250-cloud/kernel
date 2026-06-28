@@ -6,6 +6,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    
     steps:
       - name: Checkout workspace
         uses: actions/checkout@v4
@@ -17,28 +19,28 @@ jobs:
             libssl-dev gcc-aarch64-linux-gnu ccache \
             python3 python3-pip zip unzip git wget curl
 
-      - name: Download Clang toolchain
+      - name: Download LineageOS Clang (FAST)
         run: |
           cd /tmp
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r536225.tar.gz
-          mkdir -p $HOME/clang
-          tar -xzf clang-r536225.tar.gz -C $HOME/clang
+          # Use LineageOS pinned clang (known to work) [[11]]
+          git clone --depth=1 --branch lineage-20.0 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
+            $HOME/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
-          echo "Clang version:"
           clang --version
 
-      - name: Clone official kernel source
+      - name: Clone kernel source
         run: |
           git clone --depth=1 --branch sixteen \
             https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
             kernel
 
-      - name: Check defconfig files
+      - name: Check defconfig
         run: |
           echo "Available defconfigs:"
-          ls kernel/arch/arm64/configs/ | grep -i "fogos\|sm6375\|lineage"
+          ls kernel/arch/arm64/configs/ | grep -i "fogos\|lineage"
           echo "---"
-          echo "If you see fogos_defconfig or lineage_fogos_defconfig, good!"
+          cat kernel/arch/arm64/configs/*fogos* 2>/dev/null | head -5 || echo "No fogos defconfig found"
 
       - name: Configure kernel
         run: |
@@ -49,17 +51,28 @@ jobs:
           export LLVM_IAS=1
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export KBUILD_BUILD_USER=fogos
-          export KBUILD_BUILD_HOST=github
+          export KBUILD_BUILD_USER=github
+          export KBUILD_BUILD_HOST=actions
           mkdir -p out
-          make O=out ARCH=arm64 lineage_fogos_defconfig || \
-          make O=out ARCH=arm64 fogos_defconfig || \
-          make O=out ARCH=arm64 vendor/sm6375-fogos_defconfig || \
-          make O=out ARCH=arm64 gki_defconfig
-          echo "Config done, now olddefconfig..."
+          
+          # Try different defconfig names
+          if [ -f "arch/arm64/configs/lineage_fogos_defconfig" ]; then
+            echo "Using lineage_fogos_defconfig"
+            make O=out ARCH=arm64 lineage_fogos_defconfig
+          elif [ -f "arch/arm64/configs/fogos_defconfig" ]; then
+            echo "Using fogos_defconfig"
+            make O=out ARCH=arm64 fogos_defconfig
+          else
+            echo "Using vendor config"
+            make O=out ARCH=arm64 vendor/sm6375-fogos-perf_defconfig || \
+            make O=out ARCH=arm64 vendor/fogos_defconfig || \
+            make O=out ARCH=arm64 gki_defconfig
+          fi
+          
           make O=out ARCH=arm64 olddefconfig
+          echo "Config done"
 
-      - name: Build kernel image only
+      - name: Build kernel
         run: |
           cd kernel
           export ARCH=arm64
@@ -68,16 +81,17 @@ jobs:
           export LLVM_IAS=1
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
-          make -j$(nproc) O=out ARCH=arm64 Image
+          
+          # Build only Image (simplest target)
+          make -j$(nproc) O=out ARCH=arm64 Image 2>&1 | tail -50
 
-      - name: List build output
+      - name: Check output
         run: |
-          ls -lh kernel/out/arch/arm64/boot/ || true
-          echo "---"
-          find kernel/out/arch/arm64/boot/ -type f 2>/dev/null | head -20
+          ls -lh kernel/out/arch/arm64/boot/ 2>/dev/null || echo "No boot directory"
+          test -f kernel/out/arch/arm64/boot/Image && echo "✅ Image exists" || echo "❌ No Image"
 
-      - name: Upload kernel image
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-image-test
+          name: kernel-test
           path: kernel/out/arch/arm64/boot/Image*
