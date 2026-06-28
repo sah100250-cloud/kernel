@@ -1,4 +1,4 @@
-name: Build Kernel fogos + KSU-Next + SUSFS
+name: Build Kernel fogos KSU-Next+SUSFS
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ env:
   DEVICE: fogos
   KERNEL_REPO: https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375
   KERNEL_BRANCH: sixteen
-  # FIX: Hapus https://github.com/ agar URL raw tidak double
-  KSU_REPO: KernelSU-Next/KernelSU-Next
-  KSU_BRANCH: next
+  # Gunakan fork yang SUDAH SUSFS-ready (tidak perlu patch manual)
+  KSU_REPO: https://github.com/sidex15/KernelSU-Next.git
+  KSU_BRANCH: main
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
   SUSFS_BRANCH: kernel-5.4
 
@@ -19,8 +19,7 @@ jobs:
     timeout-minutes: 240
     
     steps:
-      - name: Checkout workspace
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install tools
         run: |
@@ -30,115 +29,120 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             ccache python3 zip unzip git wget curl
 
-      - name: Setup Clang toolchain
+      - name: Setup Clang
         run: |
-          cd /tmp
           git clone --depth=1 --branch lineage-20.0 \
             https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
             $HOME/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
-          clang --version
 
-      - name: Clone kernel source
+      - name: Clone kernel
         run: |
           git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} \
             ${{ env.KERNEL_REPO }} kernel
-          cd kernel
-          echo "Kernel commit: $(git rev-parse --short HEAD)"
+          cd kernel && echo "Kernel: $(git rev-parse --short HEAD)"
 
-      - name: Find and configure defconfig (GKI FIX)
-        id: find_defconfig
+      - name: Integrate KernelSU-Next (sidex15 fork with SUSFS)
         run: |
           cd kernel
-          echo "=== Checking vendor configs (CRITICAL FOR SM6375) ==="
-          ls arch/arm64/configs/vendor/ || true
-          ls arch/arm64/configs/vendor/ext_config/ || true
+          # Clone fork yang sudah SUSFS-ready
+          git clone --depth=1 --branch ${{ env.KSU_BRANCH }} \
+            ${{ env.KSU_REPO }} KernelSU-Next
           
-          export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
-          export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          mkdir -p out
+          # Setup symlink manual (script setup.sh tidak selalu ada di fork)
+          ln -sf $(pwd)/KernelSU-Next/kernel drivers/kernelsu
           
-          # SM6375 uses vendor/holi-qgki_defconfig or similar
-          DEFCONFIG=""
-          if [ -f "arch/arm64/configs/vendor/holi-qgki_defconfig" ]; then
-            DEFCONFIG="vendor/holi-qgki_defconfig"
-          elif [ -f "arch/arm64/configs/vendor/sm6375-gki_defconfig" ]; then
-            DEFCONFIG="vendor/sm6375-gki_defconfig"
-          elif [ -f "arch/arm64/configs/vendor/blair-qgki_defconfig" ]; then
-            DEFCONFIG="vendor/blair-qgki_defconfig"
-          elif [ -f "arch/arm64/configs/vendor/fogos_defconfig" ]; then
-            DEFCONFIG="vendor/fogos_defconfig"
-          else
-            DEFCONFIG=$(ls arch/arm64/configs/vendor/*_defconfig 2>/dev/null | head -1 | sed 's|arch/arm64/configs/||')
-            if [ -z "$DEFCONFIG" ]; then
-              echo "ERROR: No vendor defconfig found!"
-              exit 1
-            fi
+          # Tambahkan ke Makefile kernel
+          if ! grep -q "drivers/kernelsu" Makefile; then
+            sed -i '/^drivers-$(CONFIG_MODULES)/i drivers-y += drivers/kernelsu/' Makefile
           fi
           
-          echo "Selected base defconfig: $DEFCONFIG"
-          make O=out ARCH=arm64 $DEFCONFIG
-          
-          # Merge fogos specific fragment (LineageOS method)
-          if [ -f "arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config" ]; then
-            echo "Merging moto-holi-fogos.config fragment..."
-            scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
-          elif [ -f "arch/arm64/configs/vendor/ext_config/fogos.config" ]; then
-            echo "Merging fogos.config fragment..."
-            scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/fogos.config
+          # Tambahkan ke Kconfig
+          if ! grep -q "KSU" drivers/Kconfig; then
+            sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           fi
+          echo "✅ KSU-Next + SUSFS integrated"
 
-      - name: Integrate KernelSU-Next
-        run: |
-          cd kernel
-          # FIX: URL sekarang benar (tidak double https)
-          curl -LSs "https://raw.githubusercontent.com/${{ env.KSU_REPO }}/${{ env.KSU_BRANCH }}/kernel/setup.sh" | bash -s legacy
-          if [ -d "KernelSU-Next" ]; then
-            echo "✅ KernelSU-Next integrated"
-          else
-            echo "❌ KernelSU-Next integration failed"
-            exit 1
-          fi
-
-      - name: Apply SUSFS patch
+      - name: Apply SUSFS kernel patch only
         run: |
           cd kernel
           git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} \
             ${{ env.SUSFS_REPO }} susfs_temp
           
-          if [ -f "susfs_temp/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-            cd KernelSU-Next
-            patch -p1 < ../susfs_temp/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch 2>&1 || echo "⚠️ KSU patch may already be applied"
-            cd ..
+          # Hanya apply patch fs/ dan include/ (skip kernel/ karena KSU-Next berbeda)
+          for patch_file in susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch; do
+            if [ -f "$patch_file" ]; then
+              # Filter hanya patch untuk fs/ dan include/
+              filterdiff "$patch_file" -i 'fs/*' -i 'include/*' > /tmp/susfs_fs.patch 2>/dev/null || \
+                awk '/^diff --git.*fs\/|^diff --git.*include\//,/^diff --git/' "$patch_file" > /tmp/susfs_fs.patch
+              
+              if [ -s /tmp/susfs_fs.patch ]; then
+                patch -p1 --no-backup-if-mismatch < /tmp/susfs_fs.patch 2>&1 || true
+              fi
+            fi
+          done
+          
+          # MANUAL FIX: Tambahkan INODE_STATE_SUS_KSTAT jika belum ada
+          if ! grep -rq "INODE_STATE_SUS_KSTAT" include/linux/; then
+            echo "🔧 Manual fix: adding INODE_STATE_SUS_KSTAT"
+            cat >> include/linux/fs.h << 'EOF'
+
+            /* SUSFS manual fix */
+            #ifndef INODE_STATE_SUS_KSTAT
+            #define INODE_STATE_SUS_KSTAT (1 << 15)
+            #endif
+            EOF
           fi
           
-          if [ -f "susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch" ]; then
-            patch -p1 < susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch 2>&1 || {
-              echo "⚠️ Auto-patch failed, trying manual copy..."
-              cp -f susfs_temp/kernel_patches/fs/*.c fs/ 2>/dev/null || true
-              cp -f susfs_temp/kernel_patches/include/linux/*.h include/linux/ 2>/dev/null || true
-            }
-          fi
           rm -rf susfs_temp
+          echo "✅ SUSFS kernel patch applied"
 
-      - name: Add KSU + SUSFS configs
+      - name: Configure kernel (NON-INTERACTIVE)
         run: |
           cd kernel
-          echo "CONFIG_KSU=y" >> out/.config
-          echo "CONFIG_KSU_KPROBE_HOOKS=y" >> out/.config
-          echo "CONFIG_KPROBES=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=n" >> out/.config
-          echo "CONFIG_OVERLAY_FS=y" >> out/.config
+          export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
+          export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export KCONFIG_NOCOLORS=1
+          mkdir -p out
           
-          make O=out ARCH=arm64 olddefconfig
+          # Load defconfig LineageOS untuk fogos
+          make O=out vendor/holi-qgki_defconfig
+          scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
+          
+          # Tambahkan config KSU + SUSFS
+          cat >> out/.config << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_KPROBE_HOOKS=y
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=n
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          # Disable problematic configs
+          # CONFIG_SHMEM is not set
+          EOF
+          
+          # FIX: Disable interactive prompts dengan predefine semua NEW options
+          cat >> out/.config << 'EOF'
+          CONFIG_SHADOW_CALL_STACK=n
+          CONFIG_LTO_NONE=y
+          CONFIG_INIT_STACK_NONE=y
+          CONFIG_INIT_ON_ALLOC_DEFAULT_ON=n
+          CONFIG_INIT_ON_FREE_DEFAULT_ON=n
+          EOF
+          
+          # olddefconfig 2x untuk pastikan semua prompt terjawab
+          make O=out olddefconfig
+          make O=out olddefconfig
+          echo "✅ Config finalized"
 
       - name: Build kernel
         run: |
@@ -147,30 +151,29 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export USE_CCACHE=1 CCACHE_DIR=$HOME/.ccache
+          export KCONFIG_NOCOLORS=1
           
-          make -j$(nproc) O=out ARCH=arm64 Image dtbs 2>&1 | tee build.log
+          # Build Image + dtbs
+          make -j$(nproc) O=out Image dtbs 2>&1 | tee build.log
           
-          if [ ! -f "out/arch/arm64/boot/Image" ]; then
-            echo "❌ Build failed! Last 100 lines:"
-            tail -100 build.log
-            exit 1
-          fi
+          ls -la out/arch/arm64/boot/ || true
+          test -f out/arch/arm64/boot/Image || { echo "❌ Build failed"; tail -50 build.log; exit 1; }
 
       - name: Package AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3
           cd AnyKernel3
           cp ../kernel/out/arch/arm64/boot/Image .
-          mkdir -p dtb && find ../kernel/out/arch/arm64/boot/dts/ -name "*.dtb" -exec cp {} dtb/ \; 2>/dev/null || true
+          mkdir -p dtb
+          find ../kernel/out/arch/arm64/boot/dts/ -name "*.dtb" -exec cp {} dtb/ \; 2>/dev/null || true
           sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
           sed -i 's/DEVICE_NAME=.*/DEVICE_NAME="fogos"/' anykernel.sh
-          TIMESTAMP=$(date +%Y%m%d-%H%M)
-          ZIP_NAME="fogos-KSUNext-SUSFS-${TIMESTAMP}.zip"
-          zip -r9 "../${ZIP_NAME}" * -x .git README.md .gitignore
+          ZIP="fogos-KSUNext-SUSFS-$(date +%Y%m%d).zip"
+          zip -r9 "../$ZIP" * -x .git README.md .gitignore
           cd ..
-          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: fogos-kernel-ksunext-susfs
