@@ -1,13 +1,7 @@
-name: Build Kernel fogos RKSU+SUSFS
+name: Build Kernel fogos KSU+SUSFS
 
 on:
   workflow_dispatch:
-
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
-  DEVICE: fogos
-  KERNEL_REPO: https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375
-  KERNEL_BRANCH: sixteen
 
 jobs:
   build:
@@ -15,45 +9,105 @@ jobs:
     timeout-minutes: 240
     
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           sudo apt update -qq
-          sudo apt install -y --no-install-recommends bc bison build-essential flex libssl-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi ccache python3 zip unzip git wget curl
+          sudo apt install -y --no-install-recommends \
+            bc bison build-essential flex libssl-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            ccache python3 zip unzip git wget curl patchutils
 
       - name: Setup Clang
         run: |
-          git clone --depth=1 --branch lineage-20.0 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b $HOME/clang
+          git clone --depth=1 --branch lineage-20.0 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
+            $HOME/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
-      - name: Clone Kernel Source
+      - name: Clone kernel
         run: |
-          git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} ${{ env.KERNEL_REPO }} kernel
-          cd kernel && echo "Kernel: $(git rev-parse --short HEAD)"
+          git clone --depth=1 --branch sixteen \
+            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375 kernel
+          cd kernel
+          echo "Kernel: $(git rev-parse --short HEAD)"
 
-      - name: Fix Motorola sx937x Bug
+      - name: Fix sx937x driver
         run: |
           cd kernel
-          sed -i '1i #include <linux/i2c.h>' drivers/misc/sx937x/sx937x_sar.c
+          if [ -f "drivers/misc/sx937x/sx937x_sar.c" ]; then
+            if ! grep -q "^#include <linux/i2c.h>" drivers/misc/sx937x/sx937x_sar.c; then
+              sed -i '1i #include <linux/i2c.h>' drivers/misc/sx937x/sx937x_sar.c
+              echo "✅ Fixed sx937x"
+            fi
+          fi
 
-      - name: Integrate RKSU + SUSFS (susfs-main)
+      - name: Integrate KernelSU (tiann original)
         run: |
           cd kernel
-          curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/susfs-main/kernel/setup.sh" | bash -s susfs-main || {
-            echo "setup.sh failed, falling back to manual integration"
-            git clone --depth=1 --branch susfs-main https://github.com/rsuntk/KernelSU.git KernelSU
-            ln -sf $(pwd)/KernelSU/kernel drivers/kernelsu
-            if ! grep -q "drivers/kernelsu" Makefile; then
-              sed -i '/^drivers-$(CONFIG_MODULES)/i drivers-y += drivers/kernelsu/' Makefile
-            fi
-            if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
-              sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            fi
-          }
+          # Gunakan KernelSU original dari tiann
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
+          echo "✅ KernelSU integrated"
 
-      - name: Configure Kernel (Force Manual Hooks)
+      - name: Apply manual hooks for kernel 5.4
+        run: |
+          cd kernel
+          
+          # Patch fs/exec.c
+          if ! grep -q "ksu_handle_execve" fs/exec.c; then
+            sed -i '/static int do_execveat_common/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_execve(int *fd, const char __user *const __user *argv,\
+                                       const char __user *const __user *envp);\
+          #endif\
+          ' fs/exec.c
+          fi
+          
+          # Patch fs/open.c  
+          if ! grep -q "ksu_handle_open" fs/open.c; then
+            sed -i '/long do_sys_open/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_open(int dfd, const char __user *filename, int flags, umode_t mode);\
+          #endif\
+          ' fs/open.c
+          fi
+          
+          # Patch fs/read_write.c
+          if ! grep -q "ksu_handle_read_write" fs/read_write.c; then
+            sed -i '/ssize_t vfs_read/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_read(unsigned int fd, char __user *buf, size_t count, loff_t *pos);\
+          #endif\
+          ' fs/read_write.c
+          fi
+          
+          echo "✅ Manual hooks applied"
+
+      - name: Apply SUSFS patches
+        run: |
+          cd kernel
+          git clone --depth=1 --branch kernel-5.4 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs_temp
+          
+          # Apply kernel patches
+          patch -p1 < susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch 2>&1 || true
+          
+          # Manual fix untuk definisi yang missing
+          if ! grep -q "INODE_STATE_SUS_KSTAT" include/linux/fs.h; then
+            cat >> include/linux/fs.h << 'EOF'
+          
+          /* SUSFS manual fix */
+          #ifndef INODE_STATE_SUS_KSTAT
+          #define INODE_STATE_SUS_KSTAT (1 << 15)
+          #endif
+          EOF
+          fi
+          
+          rm -rf susfs_temp
+          echo "✅ SUSFS applied"
+
+      - name: Configure kernel
         run: |
           cd kernel
           export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
@@ -61,25 +115,32 @@ jobs:
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           mkdir -p out
           
+          # Load defconfig
           make O=out ARCH=arm64 vendor/holi-qgki_defconfig
           scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
+          
+          # Set KSU + SUSFS config
+          cat >> out/.config << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=n
+          CONFIG_OVERLAY_FS=y
+          EOF
+          
+          # Finalize
+          yes "" | make O=out ARCH=arm64 olddefconfig
+          echo "✅ Config done"
 
-          scripts/config --file out/.config --enable KSU
-          scripts/config --file out/.config --enable KSU_MANUAL_HOOK
-          scripts/config --file out/.config --disable KPROBES
-          scripts/config --file out/.config --enable KPROBES
-          scripts/config --file out/.config --enable KSU_SUSFS
-          scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
-          scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
-          scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME
-          scripts/config --file out/.config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-          scripts/config --file out/.config --disable KSU_SUSFS_ENABLE_LOG
-          scripts/config --file out/.config --enable OVERLAY_FS
-
-          yes "" | make O=out olddefconfig
-          yes "" | make O=out olddefconfig
-
-      - name: Build Kernel
+      - name: Build kernel
         run: |
           cd kernel
           export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
@@ -88,25 +149,30 @@ jobs:
           export USE_CCACHE=1 CCACHE_DIR=$HOME/.ccache
           
           make -j$(nproc) O=out Image dtbs 2>&1 | tee build.log
+          
           if [ ! -f "out/arch/arm64/boot/Image" ]; then
-            echo "Build failed!"
+            echo "❌ Build failed!"
             tail -100 build.log
             exit 1
           fi
+          echo "✅ Build SUCCESS!"
 
       - name: Package AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3
           cd AnyKernel3
           cp ../kernel/out/arch/arm64/boot/Image .
-          mkdir -p dtb && find ../kernel/out/arch/arm64/boot/dts/ -name "*.dtb" -exec cp {} dtb/ \; 2>/dev/null || true
+          mkdir -p dtb
+          find ../kernel/out/arch/arm64/boot/dts/ -name "*.dtb" -exec cp {} dtb/ \; 2>/dev/null || true
           sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
           sed -i 's/DEVICE_NAME=.*/DEVICE_NAME="fogos"/' anykernel.sh
-          zip -r9 "../fogos-RKSU-SUSFS-$(date +%Y%m%d).zip" * -x .git README.md .gitignore
+          ZIP="fogos-KSU-SUSFS-$(date +%Y%m%d).zip"
+          zip -r9 "../$ZIP" * -x .git README.md .gitignore
+          echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-kernel-rksu-susfs
-          path: fogos-RKSU-SUSFS-*.zip
+          name: fogos-kernel-ksu-susfs
+          path: ${{ env.ZIP_NAME }}
           retention-days: 30
