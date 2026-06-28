@@ -1,1 +1,218 @@
+name: Build Kernel fogos + KSU-Next + SUSFS
 
+on:
+  workflow_dispatch:
+
+env:
+  DEVICE: fogos
+  KERNEL_REPO: https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375
+  KERNEL_BRANCH: sixteen
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next
+  KSU_BRANCH: next
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_BRANCH: kernel-5.4
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt update -qq
+          sudo apt install -y --no-install-recommends \
+            bc bison build-essential flex libssl-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            ccache python3 zip unzip git wget curl
+
+      - name: Setup Clang toolchain
+        run: |
+          cd /tmp
+          git clone --depth=1 --branch lineage-20.0 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
+            $HOME/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+          clang --version
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} kernel
+          cd kernel
+          echo "Kernel commit: $(git rev-parse --short HEAD)"
+
+      - name: Find defconfig
+        id: find_defconfig
+        run: |
+          cd kernel
+          echo "=== All available defconfigs ==="
+          ls arch/arm64/configs/ || true
+          echo ""
+          echo "=== Searching for fogos/lineage defconfig ==="
+          
+          DEFCONFIG=""
+          if [ -f "arch/arm64/configs/lineage_fogos_defconfig" ]; then
+            DEFCONFIG="lineage_fogos_defconfig"
+          elif [ -f "arch/arm64/configs/fogos_defconfig" ]; then
+            DEFCONFIG="fogos_defconfig"
+          elif [ -f "arch/arm64/configs/lineage_sm6375_defconfig" ]; then
+            DEFCONFIG="lineage_sm6375_defconfig"
+          elif [ -f "arch/arm64/configs/sm6375_defconfig" ]; then
+            DEFCONFIG="sm6375_defconfig"
+          else
+            # Cari defconfig yang mengandung fogos atau sm6375
+            DEFCONFIG=$(ls arch/arm64/configs/ | grep -i "fogos\|sm6375\|lineage" | head -1 || true)
+            if [ -z "$DEFCONFIG" ]; then
+              echo "WARNING: No specific defconfig found, using gki_defconfig"
+              DEFCONFIG="gki_defconfig"
+            fi
+          fi
+          
+          echo "Selected defconfig: $DEFCONFIG"
+          echo "defconfig=$DEFCONFIG" >> $GITHUB_OUTPUT
+
+      - name: Integrate KernelSU-Next
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/${{ env.KSU_REPO }}/${{ env.KSU_BRANCH }}/kernel/setup.sh" | bash -s legacy
+          if [ -d "KernelSU-Next" ]; then
+            echo "✅ KernelSU-Next integrated"
+          else
+            echo "❌ KernelSU-Next integration failed"
+            exit 1
+          fi
+
+      - name: Apply SUSFS patch
+        run: |
+          cd kernel
+          git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} \
+            ${{ env.SUSFS_REPO }} susfs_temp
+          
+          echo "=== Applying SUSFS patches ==="
+          
+          # Patch untuk KernelSU-Next
+          if [ -f "susfs_temp/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            cd KernelSU-Next
+            patch -p1 < ../susfs_temp/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch 2>&1 || echo "⚠️ KSU patch may already be applied"
+            cd ..
+          fi
+          
+          # Patch untuk kernel 5.4
+          if [ -f "susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch" ]; then
+            patch -p1 < susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch 2>&1 || {
+              echo "⚠️ Auto-patch failed, trying manual copy..."
+              cp -f susfs_temp/kernel_patches/fs/*.c fs/ 2>/dev/null || true
+              cp -f susfs_temp/kernel_patches/include/linux/*.h include/linux/ 2>/dev/null || true
+            }
+          fi
+          
+          rm -rf susfs_temp
+          echo "✅ SUSFS patch applied"
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export KBUILD_BUILD_USER=github
+          export KBUILD_BUILD_HOST=actions
+          mkdir -p out
+          
+          # Load defconfig
+          make O=out ARCH=arm64 ${{ steps.find_defconfig.outputs.defconfig }}
+          
+          # Enable KSU + SUSFS configs
+          echo "CONFIG_KSU=y" >> out/.config
+          echo "CONFIG_KSU_KPROBE_HOOKS=y" >> out/.config
+          echo "CONFIG_KPROBES=y" >> out/.config
+          echo "CONFIG_KPROBE_EVENTS=y" >> out/.config
+          echo "CONFIG_HAVE_KPROBES=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> out/.config
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=n" >> out/.config
+          echo "CONFIG_OVERLAY_FS=y" >> out/.config
+          echo "CONFIG_OVERLAY_FS_REDIRECT_DIR=y" >> out/.config
+          
+          # Finalize config (non-interactive)
+          make O=out ARCH=arm64 olddefconfig
+          echo "✅ Kernel configured"
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export USE_CCACHE=1
+          export CCACHE_DIR=$HOME/.ccache
+          
+          # Build Image.gz + dtbs (target yang valid)
+          make -j$(nproc) O=out ARCH=arm64 Image.gz dtbs 2>&1 | tee build.log
+          
+          # Check output
+          echo "=== Build output ==="
+          ls -lh out/arch/arm64/boot/ || true
+          
+          if [ ! -f "out/arch/arm64/boot/Image.gz" ]; then
+            echo "❌ Build failed! Last 100 lines of build.log:"
+            tail -100 build.log
+            exit 1
+          fi
+          
+          echo "✅ Kernel build successful"
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+          cd AnyKernel3
+          
+          # Copy kernel image
+          cp ../kernel/out/arch/arm64/boot/Image.gz .
+          
+          # Copy DTB files
+          mkdir -p dtb
+          find ../kernel/out/arch/arm64/boot/dts/ -name "*.dtb" -exec cp {} dtb/ \; 2>/dev/null || true
+          
+          # Edit anykernel.sh
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+          sed -i 's/DEVICE_NAME=.*/DEVICE_NAME="fogos"/' anykernel.sh
+          sed -i 's/KERNEL_NAME=.*/KERNEL_NAME="AyakaUI-fogos-KSUNext-SUSFS"/' anykernel.sh
+          sed -i 's/BLOCK=auto/BLOCK=\/dev\/block\/bootdevice\/by-name\/boot/' anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=0/IS_SLOT_DEVICE=0/' anykernel.sh
+          sed -i 's/RAMDISK_COMPRESSION=auto/RAMDISK_COMPRESSION=gzip/' anykernel.sh
+          
+          # Create flashable zip
+          TIMESTAMP=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="fogos-KSUNext-SUSFS-${TIMESTAMP}.zip"
+          zip -r9 "../${ZIP_NAME}" * -x .git README.md .gitignore
+          
+          cd ..
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "✅ Package created: ${ZIP_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fogos-kernel-ksunext-susfs
+          path: |
+            ${{ env.ZIP_NAME }}
+            kernel/out/arch/arm64/boot/Image.gz
+          retention-days: 30
