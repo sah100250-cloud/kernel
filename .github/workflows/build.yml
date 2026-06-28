@@ -1,0 +1,83 @@
+name: Test Build Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison build-essential flex \
+            libssl-dev gcc-aarch64-linux-gnu ccache \
+            python3 python3-pip zip unzip git wget curl
+
+      - name: Download Clang toolchain
+        run: |
+          cd /tmp
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r536225.tar.gz
+          mkdir -p $HOME/clang
+          tar -xzf clang-r536225.tar.gz -C $HOME/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+          echo "Clang version:"
+          clang --version
+
+      - name: Clone official kernel source
+        run: |
+          git clone --depth=1 --branch sixteen \
+            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375.git \
+            kernel
+
+      - name: Check defconfig files
+        run: |
+          echo "Available defconfigs:"
+          ls kernel/arch/arm64/configs/ | grep -i "fogos\|sm6375\|lineage"
+          echo "---"
+          echo "If you see fogos_defconfig or lineage_fogos_defconfig, good!"
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KBUILD_BUILD_USER=fogos
+          export KBUILD_BUILD_HOST=github
+          mkdir -p out
+          make O=out ARCH=arm64 lineage_fogos_defconfig || \
+          make O=out ARCH=arm64 fogos_defconfig || \
+          make O=out ARCH=arm64 vendor/sm6375-fogos_defconfig || \
+          make O=out ARCH=arm64 gki_defconfig
+          echo "Config done, now olddefconfig..."
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: Build kernel image only
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j$(nproc) O=out ARCH=arm64 Image
+
+      - name: List build output
+        run: |
+          ls -lh kernel/out/arch/arm64/boot/ || true
+          echo "---"
+          find kernel/out/arch/arm64/boot/ -type f 2>/dev/null | head -20
+
+      - name: Upload kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image-test
+          path: kernel/out/arch/arm64/boot/Image*
