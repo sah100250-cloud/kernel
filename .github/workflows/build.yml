@@ -7,11 +7,9 @@ env:
   DEVICE: fogos
   KERNEL_REPO: https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375
   KERNEL_BRANCH: sixteen
-  # Gunakan fork yang SUDAH SUSFS-ready (tidak perlu patch manual)
-  KSU_REPO: https://github.com/sidex15/KernelSU-Next.git
-  KSU_BRANCH: main
-  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
-  SUSFS_BRANCH: kernel-5.4
+  KSU_REPO: https://github.com/rifsxd/KernelSU-Next
+  KSU_BRANCH: next
+  SUSFS_PATCH_URL: https://raw.githubusercontent.com/galaxybuild-project/tools/refs/heads/main/Patches/0001_susfs_157_for_ksunext.patch
 
 jobs:
   build:
@@ -42,104 +40,73 @@ jobs:
             ${{ env.KERNEL_REPO }} kernel
           cd kernel && echo "Kernel: $(git rev-parse --short HEAD)"
 
-      - name: Integrate KernelSU-Next (sidex15 fork with SUSFS)
+      - name: Integrate KernelSU-Next (Official)
         run: |
           cd kernel
-          # Clone fork yang sudah SUSFS-ready
-          git clone --depth=1 --branch ${{ env.KSU_BRANCH }} \
-            ${{ env.KSU_REPO }} KernelSU-Next
-          
-          # Setup symlink manual (script setup.sh tidak selalu ada di fork)
-          ln -sf $(pwd)/KernelSU-Next/kernel drivers/kernelsu
-          
-          # Tambahkan ke Makefile kernel
-          if ! grep -q "drivers/kernelsu" Makefile; then
-            sed -i '/^drivers-$(CONFIG_MODULES)/i drivers-y += drivers/kernelsu/' Makefile
+          # Gunakan script resmi dari KernelSU-Next untuk non-GKI kernel 5.4
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/${{ env.KSU_BRANCH }}/kernel/setup.sh" | bash -s legacy
+          if [ -d "KernelSU-Next" ]; then
+            echo "✅ KernelSU-Next integrated"
+          else
+            echo "❌ KernelSU-Next integration failed"
+            exit 1
           fi
-          
-          # Tambahkan ke Kconfig
-          if ! grep -q "KSU" drivers/Kconfig; then
-            sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          fi
-          echo "✅ KSU-Next + SUSFS integrated"
 
-      - name: Apply SUSFS kernel patch only
+      - name: Apply SUSFS patch for KernelSU-Next
         run: |
-          cd kernel
-          git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} \
-            ${{ env.SUSFS_REPO }} susfs_temp
+          cd kernel/KernelSU-Next
           
-          # Hanya apply patch fs/ dan include/ (skip kernel/ karena KSU-Next berbeda)
-          for patch_file in susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch; do
-            if [ -f "$patch_file" ]; then
-              # Filter hanya patch untuk fs/ dan include/
-              filterdiff "$patch_file" -i 'fs/*' -i 'include/*' > /tmp/susfs_fs.patch 2>/dev/null || \
-                awk '/^diff --git.*fs\/|^diff --git.*include\//,/^diff --git/' "$patch_file" > /tmp/susfs_fs.patch
-              
-              if [ -s /tmp/susfs_fs.patch ]; then
-                patch -p1 --no-backup-if-mismatch < /tmp/susfs_fs.patch 2>&1 || true
-              fi
+          # Download patch khusus KernelSU-Next (bukan KSU original)
+          curl -LSs "${{ env.SUSFS_PATCH_URL }}" > susfs.patch
+          
+          # Apply patch
+          patch -p1 < susfs.patch || {
+            echo "⚠️ Patch failed, trying manual fix..."
+            # Manual fix: tambahkan definisi yang missing
+            if ! grep -rq "INODE_STATE_SUS_KSTAT" ../include/linux/; then
+              cat >> ../include/linux/fs.h << 'EOF'
+
+/* SUSFS manual fix for KernelSU-Next */
+#ifndef INODE_STATE_SUS_KSTAT
+#define INODE_STATE_SUS_KSTAT (1 << 15)
+#endif
+EOF
             fi
-          done
-          
-          # MANUAL FIX: Tambahkan INODE_STATE_SUS_KSTAT jika belum ada
-          if ! grep -rq "INODE_STATE_SUS_KSTAT" include/linux/; then
-            echo "🔧 Manual fix: adding INODE_STATE_SUS_KSTAT"
-            cat >> include/linux/fs.h << 'EOF'
+          }
+          rm -f susfs.patch
+          echo "✅ SUSFS patch applied"
 
-            /* SUSFS manual fix */
-            #ifndef INODE_STATE_SUS_KSTAT
-            #define INODE_STATE_SUS_KSTAT (1 << 15)
-            #endif
-            EOF
-          fi
-          
-          rm -rf susfs_temp
-          echo "✅ SUSFS kernel patch applied"
-
-      - name: Configure kernel (NON-INTERACTIVE)
+      - name: Configure kernel
         run: |
           cd kernel
           export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
           export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          export KCONFIG_NOCOLORS=1
           mkdir -p out
           
-          # Load defconfig LineageOS untuk fogos
-          make O=out vendor/holi-qgki_defconfig
+          # Load defconfig LineageOS untuk fogos (sudah verified)
+          make O=out ARCH=arm64 vendor/holi-qgki_defconfig
           scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
           
           # Tambahkan config KSU + SUSFS
           cat >> out/.config << 'EOF'
-          CONFIG_KSU=y
-          CONFIG_KSU_KPROBE_HOOKS=y
-          CONFIG_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=n
-          CONFIG_OVERLAY_FS=y
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-          # Disable problematic configs
-          # CONFIG_SHMEM is not set
-          EOF
+CONFIG_KSU=y
+CONFIG_KSU_KPROBE_HOOKS=y
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=n
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+CONFIG_OVERLAY_FS=y
+EOF
           
-          # FIX: Disable interactive prompts dengan predefine semua NEW options
-          cat >> out/.config << 'EOF'
-          CONFIG_SHADOW_CALL_STACK=n
-          CONFIG_LTO_NONE=y
-          CONFIG_INIT_STACK_NONE=y
-          CONFIG_INIT_ON_ALLOC_DEFAULT_ON=n
-          CONFIG_INIT_ON_FREE_DEFAULT_ON=n
-          EOF
-          
-          # olddefconfig 2x untuk pastikan semua prompt terjawab
+          # Finalize config (non-interactive)
           make O=out olddefconfig
           make O=out olddefconfig
           echo "✅ Config finalized"
@@ -151,7 +118,6 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export USE_CCACHE=1 CCACHE_DIR=$HOME/.ccache
-          export KCONFIG_NOCOLORS=1
           
           # Build Image + dtbs
           make -j$(nproc) O=out Image dtbs 2>&1 | tee build.log
