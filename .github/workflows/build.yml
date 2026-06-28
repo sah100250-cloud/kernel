@@ -1,4 +1,4 @@
-name: 🔨 FINAL - Kernel fogos + KSU + SUSFS
+name: Build Kernel fogos + RKSU + SUSFS
 
 on:
   workflow_dispatch:
@@ -7,12 +7,16 @@ env:
   DEVICE: fogos
   KERNEL_REPO: https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375
   KERNEL_BRANCH: sixteen
+  RKSU_REPO: https://github.com/rsuntk/KernelSU
+  RKSU_BRANCH: main
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_BRANCH: kernel-5.4
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
-
+    
     steps:
       - uses: actions/checkout@v4
 
@@ -31,116 +35,103 @@ jobs:
             $HOME/clang
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
-      - name: Clone kernel
+      - name: Clone kernel source
         run: |
-          git clone --depth=1 --branch sixteen \
-            https://github.com/Motorola-SM6375-Devs/android_kernel_motorola_sm6375 kernel
-          cd kernel && echo "Kernel: $(git rev-parse --short HEAD)"
+          git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} kernel
+          cd kernel
+          echo "Kernel: $(git rev-parse --short HEAD)"
 
-      # ⭐ FIX #1: sx937x driver error (inject i2c.h)
-      - name: Fix sx937x driver
+      - name: Fix sx937x driver (missing i2c.h)
         run: |
           cd kernel
           SAR_FILE="drivers/misc/sx937x/sx937x_sar.c"
           if [ -f "$SAR_FILE" ]; then
             if ! grep -q "^#include <linux/i2c.h>" "$SAR_FILE"; then
               sed -i '1i #include <linux/i2c.h>' "$SAR_FILE"
-              echo "✅ sx937x fixed"
+              echo "✅ Fixed sx937x i2c.h include"
             fi
           fi
 
-      # ⭐ FIX #2: Pakai KernelSU ORIGINAL (tiann) - compatible SUSFS
-      - name: Integrate KernelSU Original (tiann)
+      - name: Integrate RKSU (rsuntk/KernelSU)
         run: |
           cd kernel
-          # Setup.sh otomatis detect kernel 5.4 → pakai non-GKI mode dengan KPROBE
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
           
-          # Verifikasi
-          if [ -d "KernelSU" ] || [ -L "drivers/kernelsu" ] || [ -d "drivers/kernelsu" ]; then
-            echo "✅ KernelSU integrated"
-            ls -la KernelSU 2>/dev/null || true
-            ls -la drivers/kernelsu 2>/dev/null || true
-          else
-            echo "⚠️ Manual integration fallback"
-            git clone --depth=1 https://github.com/tiann/KernelSU KernelSU
-            ln -sf $(pwd)/KernelSU/kernel drivers/kernelsu
-            if ! grep -q "drivers/kernelsu" Makefile; then
-              sed -i '/^drivers-$(CONFIG_MODULES)/i drivers-y += drivers/kernelsu/' Makefile
-            fi
-            if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
-              sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            fi
+          # Clone RKSU dengan branch main (support non-GKI)
+          git clone --depth=1 --branch ${{ env.RKSU_BRANCH }} \
+            ${{ env.RKSU_REPO }} KernelSU
+          
+          # Setup symlink
+          ln -sf $(pwd)/KernelSU/kernel drivers/kernelsu
+          
+          # Inject ke Makefile
+          if ! grep -q "drivers/kernelsu" Makefile; then
+            sed -i '/^drivers-$(CONFIG_MODULES)/i drivers-y += drivers/kernelsu/' Makefile
           fi
+          
+          # Inject ke Kconfig
+          if ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+            sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+          
+          echo "✅ RKSU integrated"
 
-      # ⭐ FIX #3: Apply SUSFS patches (compatible dengan KSU original)
       - name: Apply SUSFS patches
         run: |
           cd kernel
-          git clone --depth=1 --branch kernel-5.4 \
-            https://gitlab.com/simonpunk/susfs4ksu.git susfs_temp
-
-          # Apply KSU patch ke KernelSU original (di folder KernelSU/)
-          if [ -d "KernelSU" ]; then
-            cd KernelSU
-            patch -p1 < ../susfs_temp/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch 2>&1 || echo "⚠️ KSU patch partial"
-            cd ..
-          fi
-
-          # Apply kernel patch (dengan toleransi error)
-          patch -p1 --no-backup-if-mismatch < susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch 2>&1 || echo "⚠️ Kernel patch partial"
-
-          # ⭐ FIX #4: Manual define INODE_STATE_SUS_KSTAT
+          
+          # Clone SUSFS
+          git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} \
+            ${{ env.SUSFS_REPO }} susfs_temp
+          
+          # Apply kernel patches (skip KSU patches karena RKSU sudah include)
+          patch -p1 --no-backup-if-mismatch < susfs_temp/kernel_patches/50_add_susfs_in_kernel-5.4.patch 2>&1 || true
+          
+          # Manual fix untuk INODE_STATE_SUS_KSTAT
           if ! grep -rq "INODE_STATE_SUS_KSTAT" include/linux/; then
             cat >> include/linux/fs.h << 'EOF'
-
+          
           /* SUSFS manual fix */
           #ifndef INODE_STATE_SUS_KSTAT
           #define INODE_STATE_SUS_KSTAT (1 << 15)
           #endif
           EOF
-            echo "✅ INODE_STATE_SUS_KSTAT defined"
+            echo "✅ Added INODE_STATE_SUS_KSTAT"
           fi
-
-          # Manual define MNT_SUSFS
+          
+          # Manual fix untuk MNT_SUSFS
           if ! grep -q "MNT_SUSFS" include/linux/mount.h; then
             cat >> include/linux/mount.h << 'EOF'
-
+          
           #ifndef MNT_SUSFS
           #define MNT_SUSFS 0x10000000
           #endif
           EOF
-            echo "✅ MNT_SUSFS defined"
+            echo "✅ Added MNT_SUSFS"
           fi
-
-          # Copy susfs.h jika ada
-          if [ -f "susfs_temp/kernel_patches/include/linux/susfs.h" ]; then
-            cp susfs_temp/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
-          fi
-
+          
           rm -rf susfs_temp
+          echo "✅ SUSFS patches applied"
 
-      # ⭐ FIX #5: Urutan BENAR - Load defconfig DULU, baru set KSU configs
-      - name: Configure kernel (URUTAN BENAR)
+      - name: Configure kernel
         run: |
           cd kernel
           export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
           export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           mkdir -p out
-
-          # Step 1: Load defconfig
+          
+          # Load defconfig
           make O=out ARCH=arm64 vendor/holi-qgki_defconfig
           scripts/kconfig/merge_config.sh -O out arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
-
-          # Step 2: Set SEMUA configs (KSU + SUSFS + fix prompts)
+          
+          # Tambahkan config RKSU + SUSFS (Manual Hook mode untuk non-GKI)
           cat >> out/.config << 'EOF'
           CONFIG_KSU=y
-          CONFIG_KSU_KPROBE_HOOKS=y
-          CONFIG_KSU_MANUAL_HOOK=n
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KSU_KPROBE_HOOKS=n
           CONFIG_KPROBES=y
           CONFIG_KPROBE_EVENTS=y
-          CONFIG_HAVE_KPROBES=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -150,23 +141,18 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=n
           CONFIG_OVERLAY_FS=y
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
           CONFIG_SHADOW_CALL_STACK=n
           CONFIG_LTO_NONE=y
           CONFIG_INIT_STACK_NONE=y
           CONFIG_INIT_ON_ALLOC_DEFAULT_ON=n
           CONFIG_INIT_ON_FREE_DEFAULT_ON=n
-          CONFIG_RELR=y
-          CONFIG_KSU_DEBUG=n
-          CONFIG_KSU_DISABLE_MANAGER=n
-          CONFIG_KSU_DISABLE_POLICY=n
-          CONFIG_KSU_ALLOWLIST_WORKAROUND=n
           EOF
-
-          # Step 3: Finalize (2x untuk pastikan)
+          
+          # Finalize config (non-interactive)
           make O=out ARCH=arm64 olddefconfig
           make O=out ARCH=arm64 olddefconfig
-          echo "✅ Config finalized"
+          
+          echo "✅ Kernel configured"
 
       - name: Build kernel
         run: |
@@ -175,31 +161,40 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           export USE_CCACHE=1 CCACHE_DIR=$HOME/.ccache
-
-          make -j$(nproc) O=out Image dtbs 2>&1 | tee build.log
-
-          ls -la out/arch/arm64/boot/ || true
-          test -f out/arch/arm64/boot/Image || { echo "❌ Build failed"; tail -150 build.log; exit 1; }
+          
+          make -j$(nproc) O=out ARCH=arm64 Image dtbs 2>&1 | tee build.log
+          
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "❌ Build failed! Last 100 lines:"
+            tail -100 build.log
+            exit 1
+          fi
+          
           echo "✅ Build SUCCESS!"
 
       - name: Package AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3
           cd AnyKernel3
+          
           cp ../kernel/out/arch/arm64/boot/Image .
           mkdir -p dtb
           find ../kernel/out/arch/arm64/boot/dts/ -name "*.dtb" -exec cp {} dtb/ \; 2>/dev/null || true
+          
           sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
           sed -i 's/DEVICE_NAME=.*/DEVICE_NAME="fogos"/' anykernel.sh
-          ZIP="fogos-KSU-SUSFS-$(date +%Y%m%d-%H%M).zip"
-          zip -r9 "../$ZIP" * -x .git README.md .gitignore
+          sed -i 's/KERNEL_NAME=.*/KERNEL_NAME="AyakaUI-fogos-RKSU-SUSFS"/' anykernel.sh
+          
+          ZIP_NAME="${{ env.DEVICE }}-RKSU-SUSFS-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" * -x .git README.md .gitignore
+          
           cd ..
-          echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-kernel-ksu-susfs
+          name: ${{ env.DEVICE }}-kernel-rksu-susfs
           path: |
             ${{ env.ZIP_NAME }}
             kernel/out/arch/arm64/boot/Image
