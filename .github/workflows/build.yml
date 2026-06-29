@@ -1,4 +1,4 @@
-name: Kernel fogos | RKSU + SUSFS
+name: Kernel fogos | KSU-Next + SUSFS | SM6375
 
 on:
   workflow_dispatch:
@@ -19,17 +19,19 @@ jobs:
             build-essential ccache flex \
             libssl-dev libncurses5-dev libelf-dev \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            zip unzip cpio kmod pahole
+            zip unzip cpio kmod pahole binutils-aarch64-linux-gnu
 
       - name: Clone kernel source
         run: |
           git clone --depth=1 \
             https://github.com/${{ github.repository }}.git \
             -b sixteen kernel_src
-          echo "=== Configs available ==="
+          echo "=== Kernel version ==="
+          head -5 kernel_src/Makefile
+          echo "=== Available vendor configs ==="
           ls kernel_src/arch/arm64/configs/vendor/
-          echo "=== Ext configs ==="
-          ls kernel_src/arch/arm64/configs/vendor/ext_config/ 2>/dev/null || echo "no ext_config"
+          echo "=== Available ext_configs ==="
+          ls kernel_src/arch/arm64/configs/vendor/ext_config/ 2>/dev/null || echo "no ext_config dir"
 
       - name: Download Clang toolchain
         run: |
@@ -40,21 +42,26 @@ jobs:
           tar -xf clang.tar.gz -C clang
           echo "Clang: $(clang/bin/clang --version | head -1)"
 
-      - name: Setup RKSU (rsuntk/KernelSU)
+      # Pakai KSU-Next branch legacy_susfs_v2
+      # Ini yang dipakai ghostieqwe di Reddit dan terbukti work dengan SUSFS 2.1.0
+      - name: Setup KernelSU-Next (legacy_susfs_v2 branch)
         run: |
           cd kernel_src
-          echo ">>> Integrating RKSU..."
+          echo ">>> Integrating KernelSU-Next legacy_susfs_v2..."
           curl -LSs \
-            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
-            | bash -s main
-          echo "RKSU version: $(cat KernelSU/kernel/Makefile | grep '^VERSION' | head -1)"
+            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
+            | bash -s legacy_susfs_v2
+          echo "=== KSU-Next version ==="
+          cat KernelSU/kernel/Makefile | head -10
 
-      - name: Apply SUSFS patch for kernel 5.4
+      # Pakai patch JackA1ltman yang sudah fixed untuk kernel 5.4
+      # Ini adalah patch yang disebutkan di post Reddit yang sukses
+      - name: Apply SUSFS patch for kernel 5.4 (JackA1ltman fixed patch)
         run: |
-          echo ">>> Downloading SUSFS patch for 5.4 (NonGKI)..."
+          echo ">>> Downloading fixed SUSFS patch for kernel 5.4..."
           wget -q \
             https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_5.4.patch \
-            -O susfs_5.4.patch
+            -O susfs_patch.patch
 
           echo ">>> Cloning SUSFS source files..."
           git clone --depth=1 \
@@ -65,17 +72,30 @@ jobs:
 
           echo ">>> Copying SUSFS source files..."
           cp -v ../susfs_src/kernel_patches/fs/susfs.c fs/ 2>/dev/null || true
-          cp -v ../susfs_src/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
-          cp -v ../susfs_src/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
-          cp -v ../susfs_src/kernel_patches/include/linux/sus_su.h include/linux/ 2>/dev/null || true
+          cp -v ../susfs_src/kernel_patches/include/linux/susfs.h \
+            include/linux/ 2>/dev/null || true
+          cp -v ../susfs_src/kernel_patches/include/linux/susfs_def.h \
+            include/linux/ 2>/dev/null || true
+          cp -v ../susfs_src/kernel_patches/include/linux/sus_su.h \
+            include/linux/ 2>/dev/null || true
 
-          echo ">>> Applying SUSFS patch..."
-          patch -p1 --fuzz=3 < ../susfs_5.4.patch \
-            && echo "SUSFS patch: OK" \
-            || echo "SUSFS patch: applied with warnings"
+          echo ">>> Applying fixed SUSFS patch..."
+          patch -p1 --fuzz=3 < ../susfs_patch.patch \
+            && echo ">>> SUSFS patch: APPLIED OK" \
+            || echo ">>> SUSFS patch: applied with some warnings (biasanya tetap OK)"
 
+          echo ">>> Cleaning up patch artifacts..."
           find . -name "*.orig" -delete 2>/dev/null || true
-          find . -name "*.rej" -delete 2>/dev/null || true
+
+          echo ">>> Checking for reject files..."
+          REJ_COUNT=$(find . -name "*.rej" 2>/dev/null | wc -l)
+          if [ "$REJ_COUNT" -gt "0" ]; then
+            echo "WARNING: $REJ_COUNT reject files found:"
+            find . -name "*.rej" -exec echo "  {}" \;
+            find . -name "*.rej" -delete
+          else
+            echo "No reject files - patch applied cleanly!"
+          fi
 
       - name: Generate defconfig for fogos
         run: |
@@ -84,28 +104,30 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
 
-          MAKE_ARGS="O=../out ARCH=arm64 CC=clang \
+          MAKE_BASE="make O=../out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
 
-          echo ">>> Step 1: Apply base holi-qgki defconfig"
-          make $MAKE_ARGS vendor/holi-qgki_defconfig
+          echo ">>> Step 1: Base defconfig (holi-qgki)"
+          # holi-qgki adalah base yang benar untuk fogos/SM6375
+          $MAKE_BASE vendor/holi-qgki_defconfig
 
-          echo ">>> Step 2: Merge fogos-specific configs"
+          echo ">>> Step 2: Merge fogos-specific ext configs"
+          # Urutan merge ini berdasarkan konfirmasi dari issue GitHub MotorolaMobilityLLC/kernel-msm#616
           for cfg in \
             arch/arm64/configs/vendor/ext_config/moto-holi.config \
             arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config; do
             if [ -f "$cfg" ]; then
-              echo "Merging: $cfg"
+              echo "  Merging: $cfg"
               ./scripts/kconfig/merge_config.sh -m -O ../out ../out/.config "$cfg"
             else
-              echo "Warning: $cfg not found, skipping"
+              echo "  Warning: $cfg not found"
             fi
           done
 
-          echo ">>> Step 3: Enable RKSU + SUSFS configs"
-          scripts/config --file ../out/.config \
+          echo ">>> Step 3: Enable KSU-Next + SUSFS configs"
+          ./scripts/config --file ../out/.config \
             -e KSU \
             -d KSU_WITH_KPROBES \
             -e KSU_MANUAL_HOOK \
@@ -123,17 +145,18 @@ jobs:
             -d KSU_SUSFS_SUS_SU
 
           echo ">>> Step 4: Finalize with olddefconfig"
-          make $MAKE_ARGS olddefconfig
+          $MAKE_BASE olddefconfig
 
-          echo "=== KSU + SUSFS config result ==="
-          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" ../out/.config || echo "ERROR: KSU/SUSFS not found in config!"
+          echo ">>> Verifying KSU + SUSFS in final config:"
+          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" ../out/.config \
+            || echo "ERROR: KSU/SUSFS config missing!"
 
       - name: Build kernel
         run: |
           cd kernel_src
           export PATH="${{ github.workspace }}/clang/bin:$PATH"
 
-          echo ">>> Building with $(nproc) threads..."
+          echo ">>> Building kernel with $(nproc) threads..."
           make -j$(nproc) \
             O=../out \
             ARCH=arm64 \
@@ -145,14 +168,15 @@ jobs:
             LLVM_IAS=1 \
             Image.gz dtbo.img 2>&1 | tee ../build.log
 
-          echo "=== Build result ==="
+          echo ">>> Build result:"
           if [ -f ../out/arch/arm64/boot/Image.gz ]; then
-            echo "SUCCESS: Image.gz built"
-            ls -lh ../out/arch/arm64/boot/
+            echo "SUCCESS: Image.gz ready"
+            ls -lh ../out/arch/arm64/boot/Image.gz
+            ls -lh ../out/arch/arm64/boot/dtbo.img 2>/dev/null || true
           else
             echo "FAILED: Image.gz not found"
-            echo "Last 50 lines of build log:"
-            tail -50 ../build.log
+            echo ">>> Last 100 lines of build log:"
+            tail -100 ../build.log
             exit 1
           fi
 
@@ -165,10 +189,11 @@ jobs:
           [ -f out/arch/arm64/boot/dtbo.img ] && \
             cp out/arch/arm64/boot/dtbo.img ak3/ || true
 
-          cat > ak3/anykernel.sh << 'EOF'
-          # AnyKernel3 for fogos (Moto G34/G45 5G) - RKSU + SUSFS
+          cat > ak3/anykernel.sh << 'AKEOF'
+          # AnyKernel3 - fogos (Moto G34/G45 5G)
+          # KernelSU-Next + SUSFS
           properties() { '
-          kernel.string=RKSU + SUSFS | fogos | AyakaUI
+          kernel.string=KSU-Next + SUSFS | fogos AyakaUI
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -177,9 +202,10 @@ jobs:
           device.name1=fogos
           device.name2=XT2363-2
           device.name3=XT2363-3
-          device.name4=XT2349-1
-          device.name5=moto g45 5G
-          device.name6=moto g34 5G
+          device.name4=XT2363-5
+          device.name5=XT2349-1
+          device.name6=moto g45 5G
+          device.name7=moto g34 5G
           '; }
           block=/dev/block/bootdevice/by-name/boot
           is_slot_device=1
@@ -188,22 +214,24 @@ jobs:
           . tools/ak3-core.sh
           . tools/repacktools.sh
           . tools/repack.sh
-          EOF
+          AKEOF
 
           DATE=$(date +%Y%m%d-%H%M)
-          ZIP="kernel-fogos-rksu-susfs-${DATE}.zip"
+          ZIP="kernel-fogos-ksunext-susfs-${DATE}.zip"
           cd ak3
           zip -r9 "../${ZIP}" . -x ".git/*" "README.md"
           cd ..
           echo "ZIP_NAME=${ZIP}" >> $GITHUB_ENV
+          echo "=== Kernel zip ready ==="
           ls -lh "${ZIP}"
 
       - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-fogos-rksu-susfs-${{ github.run_number }}
+          name: kernel-fogos-ksunext-susfs-${{ github.run_number }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 30
+          if-no-files-found: error
 
       - name: Upload build log on failure
         if: failure()
@@ -212,3 +240,14 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: build.log
           retention-days: 7
+
+      - name: Build summary
+        if: success()
+        run: |
+          echo "================================"
+          echo "BUILD SUKSES!"
+          echo "KSU: legacy_susfs_v2 branch"
+          echo "SUSFS: JackA1ltman fixed patch for 5.4"
+          echo "Kernel: SM6375 fogos (Moto G34/G45 5G)"
+          echo "ZIP: ${{ env.ZIP_NAME }}"
+          echo "================================"
